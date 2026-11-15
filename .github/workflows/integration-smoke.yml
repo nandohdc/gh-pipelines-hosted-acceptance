@@ -1,0 +1,175 @@
+# Integration smoke is a parse-and-lint drift probe for Canary consumer
+# repositories. It does not execute a consumer pipeline.
+name: integration-smoke
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      consumer:
+        description: "Canary consumer repository to run"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - financial-events-ingestion-api
+      runner-label:
+        description: "Deprecated and ignored; probes always use GitHub-hosted runners."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  select-consumers:
+    name: select Canary consumer repositories
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Build Canary consumer repository matrix
+        id: matrix
+        shell: bash
+        env:
+          REQUESTED_CONSUMER: ${{ github.event_name == 'workflow_dispatch' && inputs.consumer || 'all' }}
+        run: |
+          set -euo pipefail
+
+          case "${REQUESTED_CONSUMER}" in
+            all)
+              matrix='[{"id":"financial-events-ingestion-api","repository":"nandohdc/financial-events-ingestion-api","language":"go"}]'
+              ;;
+            financial-events-ingestion-api)
+              matrix='[{"id":"financial-events-ingestion-api","repository":"nandohdc/financial-events-ingestion-api","language":"go"}]'
+              ;;
+            *)
+              echo "::error::Unsupported Canary consumer repository input: ${REQUESTED_CONSUMER}"
+              exit 1
+              ;;
+          esac
+
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+
+  parse-consumer:
+    name: parse ${{ matrix.id }}
+    needs: select-consumers
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.select-consumers.outputs.matrix) }}
+    steps:
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash" -o /tmp/download-actionlint.bash
+          bash /tmp/download-actionlint.bash 1.7.12 /tmp
+          echo "/tmp" >> "${GITHUB_PATH}"
+
+      - name: Require integration token
+        shell: bash
+        env:
+          INTEGRATION_PAT: ${{ secrets.INTEGRATION_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${INTEGRATION_PAT}" ]; then
+            echo "::error::Missing required INTEGRATION_PAT secret for private Canary consumer repository checkout."
+            exit 1
+          fi
+
+      - name: Checkout Canary consumer repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.INTEGRATION_PAT }}
+          CONSUMER_REPOSITORY: ${{ matrix.repository }}
+        run: |
+          set -euo pipefail
+          gh repo clone "${CONSUMER_REPOSITORY}" consumer -- --depth 1 --branch main
+
+      - name: Rewrite gh-pipelines refs to @main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd consumer
+
+          if [ ! -d ".github/workflows" ]; then
+            echo "::error::No .github/workflows directory found in Canary consumer repository."
+            exit 1
+          fi
+
+          mapfile -t workflow_files < <(find .github/workflows -maxdepth 1 -type f \( -name "*.yml" -o -name "*.yaml" \) | sort)
+          if ((${#workflow_files[@]} == 0)); then
+            echo "::error::No Caller workflow files found in Canary consumer repository."
+            exit 1
+          fi
+
+          find_pipeline_refs() {
+            local pattern='uses:[[:space:]]*nandohdc/gh-pipelines/.github/workflows/[^[:space:]]+'
+            if command -v rg >/dev/null 2>&1; then
+              rg -n --no-heading "${pattern}" .github/workflows || true
+            else
+              grep -REn "${pattern}" .github/workflows || true
+            fi
+          }
+
+          matches_before="$(find_pipeline_refs)"
+          matches_before_count=$(printf '%s\n' "${matches_before}" | sed '/^$/d' | wc -l | tr -d ' ')
+
+          for workflow in "${workflow_files[@]}"; do
+            perl -0pi -e 's~(uses:\s*nandohdc/gh-pipelines/\.github/workflows/[^\s@]+)(@[^\s]+)?~$1\@main~g' "${workflow}"
+          done
+
+          matches_after="$(find_pipeline_refs)"
+          matches_after_count=$(printf '%s\n' "${matches_after}" | sed '/^$/d' | wc -l | tr -d ' ')
+          echo "Rewrote ${matches_before_count} references to gh-pipelines @main in ${PWD}/.github/workflows."
+          echo "Remaining gh-pipelines references after rewrite: ${matches_after_count}"
+
+      - name: Lint rewritten Caller workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd consumer
+          mapfile -t workflow_files < <(find .github/workflows -maxdepth 1 -type f \( -name "*.yml" -o -name "*.yaml" \) | sort)
+          actionlint -shellcheck= "${workflow_files[@]}"
+
+      - name: Open issue on failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          CONSUMER_ID: ${{ matrix.id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          issue_label="drift"
+          issue_title="Integration drift: ${CONSUMER_ID}"
+          issue_color="D93F0B"
+          issue_description="Detected integration drift against Canary consumer repositories"
+
+          issue_body="$(printf 'Integration smoke failed while validating %s.\n\nRun: %s\n' "${CONSUMER_ID}" "${RUN_URL}")"
+
+          if ! gh label list --repo "${REPOSITORY}" --limit 200 --json name --jq '.[].name' | grep -qx "${issue_label}"; then
+            gh label create "${issue_label}" --repo "${REPOSITORY}" --color "${issue_color}" --description "${issue_description}"
+          fi
+
+          existing_issue_number="$(gh issue list --repo "${REPOSITORY}" --state open --limit 200 --json number,title | jq -r --arg title "${issue_title}" '.[] | select(.title == $title) | .number' | head -n 1)"
+          if [ -n "${existing_issue_number}" ]; then
+            echo "::notice::Open issue #${existing_issue_number} already exists for ${issue_title}; skipping create."
+            exit 0
+          fi
+
+          gh issue create \
+            --repo "${REPOSITORY}" \
+            --label "${issue_label}" \
+            --title "${issue_title}" \
+            --body "${issue_body}"
