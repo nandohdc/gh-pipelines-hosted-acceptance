@@ -1,0 +1,30 @@
+name: candidate-smoke
+'on':
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact candidate commit SHA in source repository
+        required: true
+        type: string
+      request_id:
+        description: Unique candidate smoke request identifier
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  baseline-guard:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Require ephemeral candidate smoke branch
+      shell: bash
+      env:
+        GITHUB_REF_NAME: ${{ github.ref_name }}
+      run: 'set -euo pipefail
+
+        echo "::error::candidate-smoke.yml must be dispatched from a smoke/candidate-*
+        branch, not ${GITHUB_REF_NAME}."
+
+        exit 1
+
+        '
