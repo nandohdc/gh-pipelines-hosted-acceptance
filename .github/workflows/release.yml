@@ -1,0 +1,219 @@
+# =============================================================================
+# release.yml — Internal automated semver release workflow
+# =============================================================================
+# Triggered on push to main; release type is resolved from labels on the
+# merged PR associated with the pushed commit.
+#
+# Label convention:
+#   - release:patch -> bump patch (vX.Y.Z -> vX.Y.(Z+1))
+#   - release:minor -> bump minor (vX.Y.Z -> vX.(Y+1).0)
+#   - release:major -> bump major (vX.Y.Z -> v(X+1).0.0)
+#   - no release label -> no release action (workflow exits successfully)
+#
+# Auth decision:
+#   - Option (a): uses GITHUB_TOKEN and assumes tag `v1` is not protected.
+# =============================================================================
+
+name: release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine release type from merged PR labels
+        id: release_type
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          # Resolve the merged PR number. Prefer the squash-merge commit
+          # subject "… (#N)" (GitHub's default squash format, used by Dependabot):
+          # it needs no API call and is immune to the eventual-consistency lag of
+          # /commits/{sha}/pulls right after a squash merge.
+          pr_number=""
+          subject="${HEAD_COMMIT_MESSAGE%%$'\n'*}"
+          if [[ "${subject}" =~ \(#([0-9]+)\)[[:space:]]*$ ]]; then
+            pr_number="${BASH_REMATCH[1]}"
+          fi
+          # Classic merge-commit fallback ("Merge pull request #N …").
+          if [ -z "${pr_number}" ] && [[ "${HEAD_COMMIT_MESSAGE}" =~ ^Merge[[:space:]]pull[[:space:]]request[[:space:]]#([0-9]+) ]]; then
+            pr_number="${BASH_REMATCH[1]}"
+          fi
+          # API fallback. No "|| true": a genuine failure (e.g. gh missing on a
+          # self-hosted runner) must fail the run, not silently skip the release.
+          if [ -z "${pr_number}" ]; then
+            pr_number=$(
+              gh api "/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                --jq 'map(select(.merged_at != null and .base.ref == "main")) | .[0].number // empty'
+            )
+          fi
+          if [ -z "${pr_number}" ]; then
+            echo "No merged PR associated with commit ${GITHUB_SHA}; skipping release."
+            {
+              echo "should_release=false"
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          release_type=""
+          labels=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/${pr_number}/labels" --jq '.[].name')
+
+          if echo "${labels}" | grep -qx 'release:major'; then
+            release_type="major"
+          elif echo "${labels}" | grep -qx 'release:minor'; then
+            release_type="minor"
+          elif echo "${labels}" | grep -qx 'release:patch'; then
+            release_type="patch"
+          fi
+
+          if [ -z "${release_type}" ]; then
+            echo "No release label found; skipping release."
+            {
+              echo "should_release=false"
+            } >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Detected release type: ${release_type} (PR #${pr_number})"
+          {
+            echo "should_release=true"
+            echo "release_type=${release_type}"
+            echo "pr_number=${pr_number}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout merge commit with tags
+        if: steps.release_type.outputs.should_release == 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Guard - supply-chain-attest manifest declares attest-sbom
+        if: steps.release_type.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="actions/supply-chain-attest/action.yml"
+          if ! grep -qE '^[[:space:]]*attest-sbom:' "${manifest}"; then
+            echo "::error::${manifest} at the release commit does not declare 'attest-sbom'; docker-build.yml's attest-sbom job would silently no-op behind @v1. Aborting release."
+            exit 1
+          fi
+          echo "Release guard OK: ${manifest} declares attest-sbom."
+
+      - name: Compute next version
+        if: steps.release_type.outputs.should_release == 'true'
+        id: semver
+        shell: bash
+        env:
+          RELEASE_TYPE: ${{ steps.release_type.outputs.release_type }}
+        run: |
+          set -euo pipefail
+
+          latest_tag=$(
+            git ls-remote --tags --refs origin 'v*' \
+              | awk '{print $2}' \
+              | sed 's#refs/tags/##' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n1 \
+              || true
+          )
+          if [ -z "${latest_tag}" ]; then
+            latest_tag="v0.0.0"
+          fi
+
+          IFS='.' read -r major minor patch <<< "${latest_tag#v}"
+          case "${RELEASE_TYPE}" in
+            patch)
+              patch=$((patch + 1))
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            *)
+              echo "::error::Unsupported release type: ${RELEASE_TYPE}"
+              exit 1
+              ;;
+          esac
+
+          next_tag="v${major}.${minor}.${patch}"
+          target_sha="${GITHUB_SHA}"
+
+          {
+            echo "latest_tag=${latest_tag}"
+            echo "next_tag=${next_tag}"
+            echo "target_sha=${target_sha}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Create release tag and move v1
+        if: steps.release_type.outputs.should_release == 'true'
+        shell: bash
+        env:
+          NEXT_TAG: ${{ steps.semver.outputs.next_tag }}
+          TARGET_SHA: ${{ steps.semver.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          existing_sha=$(
+            git ls-remote --tags --refs origin "refs/tags/${NEXT_TAG}" \
+              | awk '{print $1}' \
+              || true
+          )
+          if [ -n "${existing_sha}" ]; then
+            if [ "${existing_sha}" != "${TARGET_SHA}" ]; then
+              echo "::error::Tag ${NEXT_TAG} already exists and points to ${existing_sha}, expected ${TARGET_SHA}."
+              exit 1
+            fi
+            echo "Tag ${NEXT_TAG} already exists at target SHA; continuing."
+          else
+            git tag "${NEXT_TAG}" "${TARGET_SHA}"
+            git push origin "refs/tags/${NEXT_TAG}"
+          fi
+
+          git tag -f v1 "${TARGET_SHA}"
+          git push origin "refs/tags/v1" --force
+
+      - name: Create GitHub release with generated notes
+        if: steps.release_type.outputs.should_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_TAG: ${{ steps.semver.outputs.next_tag }}
+          TARGET_SHA: ${{ steps.semver.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${NEXT_TAG}" >/dev/null 2>&1; then
+            echo "Release ${NEXT_TAG} already exists; skipping creation."
+            exit 0
+          fi
+
+          gh release create "${NEXT_TAG}" \
+            --target "${TARGET_SHA}" \
+            --title "${NEXT_TAG}" \
+            --generate-notes
